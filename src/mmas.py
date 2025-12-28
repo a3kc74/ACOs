@@ -28,6 +28,8 @@ class MaxMinAntSystem(TSPAlgorithm):
         evaporation_rate: float = 0.02,
         use_iteration_best: bool = True,
         pbest: float = 0.05,
+        apply_local_search_to_all: bool = False,
+        max_local_search_iterations: int = 100,
         seed: Optional[int] = None
     ):
         """
@@ -41,6 +43,8 @@ class MaxMinAntSystem(TSPAlgorithm):
             evaporation_rate: Pheromone evaporation rate (ρ), range [0, 1]
             use_iteration_best: If True, use iteration-best; else use global-best
             pbest: Probability for calculating tau_max (typically 0.05)
+            apply_local_search_to_all: If True, apply 2-opt to all ants; else only to iteration-best
+            max_local_search_iterations: Maximum iterations for 2-opt local search
             seed: Random seed for reproducibility
         """
         super().__init__(distance_matrix)
@@ -51,6 +55,8 @@ class MaxMinAntSystem(TSPAlgorithm):
         self.evaporation_rate = evaporation_rate
         self.use_iteration_best = use_iteration_best
         self.pbest = pbest
+        self.apply_local_search_to_all = apply_local_search_to_all
+        self.max_local_search_iterations = max_local_search_iterations
         
         # Random number generator
         self.rng = np.random.default_rng(seed)
@@ -64,6 +70,10 @@ class MaxMinAntSystem(TSPAlgorithm):
         # Stagnation detection
         self.stagnation_counter: int = 0
         self.stagnation_threshold: int = 0
+        
+        # Local search statistics
+        self.local_search_improvements = 0
+        self.total_local_searches = 0
         
     def _initialize(self) -> None:
         """Initialize pheromone matrix, heuristic information, and bounds."""
@@ -79,16 +89,24 @@ class MaxMinAntSystem(TSPAlgorithm):
         # Initialize pheromone bounds
         self._update_pheromone_bounds()
         
-        # Initialize pheromone matrix with τ_max
+        # print("tau_min set to", self.tau_min)
+        # print("tau_max set to", self.tau_max)
+        # print("initial_best_distance set to", self.best_distance)
+
+        # Initialize pheromone matrix with τ_max~
         self.pheromone = np.full(
             (self.num_cities, self.num_cities),
             self.tau_max,
             dtype=np.float64
         )
         
+        self._update_pheromones(nn_tour, nn_distance)
+
         # Stagnation threshold (reinitialize if no improvement for this many iterations)
-        self.stagnation_threshold = max(25, self.num_cities // 2)
+        self.stagnation_threshold = max(100, self.num_cities // 2)
         self.stagnation_counter = 0
+        # print("stagnation_threshold set to", self.stagnation_threshold)
+        
         
     def _nearest_neighbor_solution(self) -> Tuple[List[int], float]:
         """
@@ -152,11 +170,15 @@ class MaxMinAntSystem(TSPAlgorithm):
         self.reset()
         self._initialize()
         
+        self.local_search_improvements = 0
+        self.total_local_searches = 0
+        
         iterations_without_improvement = 0
         iteration_best_tour = None
         iteration_best_distance = float('inf')
         
         for iteration in range(max_iterations):
+            # print(f"MMAS Iteration {iteration + 1}")
             # Construct solutions for all ants
             iteration_tours = []
             iteration_distances = []
@@ -167,6 +189,12 @@ class MaxMinAntSystem(TSPAlgorithm):
             for ant in range(self.num_ants):
                 tour = self._construct_solution()
                 distance = self.calculate_tour_distance(tour)
+                
+                # Apply local search based on strategy
+                if self.apply_local_search_to_all:
+                    # Apply 2-opt to all ants
+                    tour, distance = self._two_opt_improvement(tour, distance)
+                
                 iteration_tours.append(tour)
                 iteration_distances.append(distance)
                 
@@ -174,20 +202,33 @@ class MaxMinAntSystem(TSPAlgorithm):
                 if distance < iteration_best_distance:
                     iteration_best_distance = distance
                     iteration_best_tour = tour
+            
+            # Update global best solution
+            improved = self._update_best_solution(iteration_best_tour, iteration_best_distance)
+            if improved:
+                iterations_without_improvement = 0
+                self.stagnation_counter = 0
+                self._update_pheromone_bounds()
+                if verbose:
+                    print(f"Iteration {iteration + 1}: New best = {iteration_best_distance:.2f}")
+            else:
+                iterations_without_improvement += 1
+                self.stagnation_counter += 1
+            
+            # If not applying to all, apply 2-opt to iteration-best only
+            if not self.apply_local_search_to_all:
+                iteration_best_tour, iteration_best_distance = self._two_opt_improvement(
+                    iteration_best_tour, iteration_best_distance
+                )
                 
-                # Update global best solution
-                improved = self._update_best_solution(tour, distance)
-                if improved:
+                # Check if local search improved the best solution
+                if self._update_best_solution(iteration_best_tour, iteration_best_distance):
                     iterations_without_improvement = 0
                     self.stagnation_counter = 0
                     self._update_pheromone_bounds()
                     if verbose:
-                        print(f"Iteration {iteration + 1}: New best = {distance:.2f}")
-                else:
-                    iterations_without_improvement += 1
-                    self.stagnation_counter += 1
-            
-            # Choose which tour to use for pheromone update
+                        print(f"Iteration {iteration + 1}: Local search improved to {iteration_best_distance:.2f}")
+
             if self.use_iteration_best:
                 update_tour = iteration_best_tour
                 update_distance = iteration_best_distance
@@ -199,11 +240,15 @@ class MaxMinAntSystem(TSPAlgorithm):
             self._update_pheromones(update_tour, update_distance)
             
             # Check for stagnation and reinitialize if needed
-            if self.stagnation_counter >= self.stagnation_threshold:
-                self._reinitialize_pheromones()
-                self.stagnation_counter = 0
-                if verbose:
-                    print(f"Iteration {iteration + 1}: Pheromone reinitialization")
+            if self.stagnation_counter > 0:
+                if self.stagnation_counter % (self.stagnation_threshold // 4) == 0:
+                    self._apply_pheromone_smoothing()
+                    print(f"Iteration {iteration + 1}: Pheromone smoothing applied")
+                if self.stagnation_counter >= self.stagnation_threshold:
+                    self._reinitialize_pheromones()
+                    self.stagnation_counter = 0
+                    if verbose:
+                        print(f"Iteration {iteration + 1}: Pheromone reinitialization")
             
             # Record history
             self.history['best_distances'].append(self.best_distance)
@@ -216,7 +261,74 @@ class MaxMinAntSystem(TSPAlgorithm):
                     print(f"Early stopping at iteration {iteration + 1}")
                 break
         
+        if verbose:
+            improvement_rate = (self.local_search_improvements / max(self.total_local_searches, 1)) * 100
+            print(f"\nLocal Search Statistics:")
+            print(f"  Total applications: {self.total_local_searches}")
+            print(f"  Improvements found: {self.local_search_improvements}")
+            print(f"  Improvement rate: {improvement_rate:.1f}%")
+        
         return self.get_best_solution()
+    
+    def _two_opt_improvement(self, tour: List[int], current_distance: float) -> Tuple[List[int], float]:
+        """
+        Apply 2-opt local search to improve a tour.
+        
+        2-opt removes two edges and reconnects the tour in a different way,
+        reducing the total distance if beneficial.
+        
+        Args:
+            tour: Initial tour to improve
+            current_distance: Current tour distance
+            
+        Returns:
+            Tuple of (improved_tour, improved_distance)
+        """
+        self.total_local_searches += 1
+        improved_tour = tour.copy()
+        improved_distance = current_distance
+        improved = True
+        iterations = 0
+        
+        while improved and iterations < self.max_local_search_iterations:
+            improved = False
+            iterations += 1
+            
+            for i in range(1, len(improved_tour) - 1):
+                for j in range(i + 1, len(improved_tour)):
+                    # Calculate distance change if we reverse tour[i:j+1]
+                    # Current edges: (i-1, i) and (j, j+1)
+                    # New edges: (i-1, j) and (i, j+1)
+                    
+                    city_before_i = improved_tour[i - 1]
+                    city_i = improved_tour[i]
+                    city_j = improved_tour[j]
+                    city_after_j = improved_tour[(j + 1) % len(improved_tour)]
+                    
+                    # Current distance
+                    current_dist = (
+                        self.distance_matrix[city_before_i, city_i] +
+                        self.distance_matrix[city_j, city_after_j]
+                    )
+                    
+                    # New distance after 2-opt swap
+                    new_dist = (
+                        self.distance_matrix[city_before_i, city_j] +
+                        self.distance_matrix[city_i, city_after_j]
+                    )
+                    
+                    # If improvement found, reverse the segment
+                    if new_dist < current_dist:
+                        improved_tour[i:j+1] = reversed(improved_tour[i:j+1])
+                        improved_distance += new_dist - current_dist
+                        improved = True
+                        self.local_search_improvements += 1
+                        break
+                
+                if improved:
+                    break
+        
+        return improved_tour, improved_distance
     
     def _construct_solution(self) -> List[int]:
         """
@@ -286,6 +398,8 @@ class MaxMinAntSystem(TSPAlgorithm):
         # Pheromone deposit: Only best ant deposits
         deposit = 1.0 / distance
         
+        # print(f"tau_min: {self.tau_min}, tau_max: {self.tau_max}, Depositing pheromone: {deposit}")
+
         for i in range(len(tour)):
             city_a = tour[i]
             city_b = tour[(i + 1) % len(tour)]
@@ -347,6 +461,8 @@ class MaxMinAntSystem(TSPAlgorithm):
             'evaporation_rate': self.evaporation_rate,
             'use_iteration_best': self.use_iteration_best,
             'pbest': self.pbest,
+            'apply_local_search_to_all': self.apply_local_search_to_all,
+            'max_local_search_iterations': self.max_local_search_iterations,
             'tau_min': self.tau_min,
             'tau_max': self.tau_max,
             'stagnation_threshold': self.stagnation_threshold

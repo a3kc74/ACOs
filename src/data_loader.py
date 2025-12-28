@@ -56,7 +56,7 @@ class DataLoader:
             elif line.startswith('NODE_COORD_SECTION'):
                 coord_section_start = i + 1
                 break
-        
+
         if coord_section_start == -1:
             raise ValueError("NODE_COORD_SECTION not found in file")
         

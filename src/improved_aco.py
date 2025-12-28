@@ -1,5 +1,5 @@
 """
-Improved ACO - MMAS with 2-opt Local Search for enhanced solution quality.
+Improved ACO - MMAS with 2-opt Local Search and Candidate Lists for enhanced solution quality.
 """
 
 import numpy as np
@@ -9,17 +9,20 @@ from src.mmas import MaxMinAntSystem
 
 class ImprovedACO(MaxMinAntSystem):
     """
-    Improved Ant Colony Optimization combining MMAS with 2-opt local search.
+    Improved Ant Colony Optimization combining MMAS with 2-opt local search and candidate lists.
     
-    This algorithm enhances MMAS by applying 2-opt local search to improve
-    solution quality. The local search can be applied to:
-    - Only the best ant's tour (faster, less computational cost)
-    - All ants' tours (slower, potentially better exploration)
+    This algorithm enhances MMAS by:
+    1. Using candidate lists (nearest neighbors) for efficient solution construction
+    2. Applying 2-opt local search to improve solution quality
+    
+    The candidate list restricts the search to the k nearest neighbors of each city,
+    significantly speeding up solution construction while maintaining solution quality.
     
     The 2-opt local search removes crossing edges and reconnects the tour
     in a better way, guaranteeing local optimality.
     
     Expected benefits:
+    - Faster construction phase (reduced from O(n²) to O(k) per city)
     - Better convergence speed
     - Shorter final path lengths
     - Higher quality solutions
@@ -36,6 +39,7 @@ class ImprovedACO(MaxMinAntSystem):
         pbest: float = 0.05,
         apply_local_search_to_all: bool = False,
         max_local_search_iterations: int = 100,
+        candidate_list_size: Optional[int] = None,
         seed: Optional[int] = None
     ):
         """
@@ -51,6 +55,7 @@ class ImprovedACO(MaxMinAntSystem):
             pbest: Probability for calculating tau_max
             apply_local_search_to_all: If True, apply 2-opt to all ants; else only to best
             max_local_search_iterations: Maximum iterations for 2-opt (early stopping)
+            candidate_list_size: Number of nearest neighbors in candidate list (None = use all cities)
             seed: Random seed for reproducibility
         """
         super().__init__(
@@ -67,9 +72,20 @@ class ImprovedACO(MaxMinAntSystem):
         self.apply_local_search_to_all = apply_local_search_to_all
         self.max_local_search_iterations = max_local_search_iterations
         
+        # Candidate list configuration
+        if candidate_list_size is None:
+            # Default: min(20, max(15, num_cities // 5))
+            self.candidate_list_size = min(20, max(15, self.num_cities // 5))
+        else:
+            self.candidate_list_size = min(candidate_list_size, self.num_cities - 1)
+        
+        self.candidate_lists: Optional[np.ndarray] = None
+        
         # Statistics
         self.local_search_improvements = 0
         self.total_local_searches = 0
+        self.candidate_list_usage = 0
+        self.fallback_to_all_cities = 0
         
     def solve(
         self,
@@ -123,17 +139,17 @@ class ImprovedACO(MaxMinAntSystem):
                     iteration_best_distance = distance
                     iteration_best_tour = tour
                 
-                # Update global best solution
-                improved = self._update_best_solution(tour, distance)
-                if improved:
-                    iterations_without_improvement = 0
-                    self.stagnation_counter = 0
-                    self._update_pheromone_bounds()
-                    if verbose:
-                        print(f"Iteration {iteration + 1}: New best = {distance:.2f}")
-                else:
-                    iterations_without_improvement += 1
-                    self.stagnation_counter += 1
+            # Update global best solution
+            improved = self._update_best_solution(iteration_best_tour, iteration_best_distance)
+            if improved:
+                iterations_without_improvement = 0
+                self.stagnation_counter = 0
+                self._update_pheromone_bounds()
+                if verbose:
+                    print(f"Iteration {iteration + 1}: New best = {iteration_best_distance:.2f}")
+            else:
+                iterations_without_improvement += 1
+                self.stagnation_counter += 1
             
             # If not applying to all, apply 2-opt to iteration-best only
             if not self.apply_local_search_to_all:
@@ -161,11 +177,15 @@ class ImprovedACO(MaxMinAntSystem):
             self._update_pheromones(update_tour, update_distance)
             
             # Check for stagnation and reinitialize if needed
-            if self.stagnation_counter >= self.stagnation_threshold:
-                self._reinitialize_pheromones()
-                self.stagnation_counter = 0
-                if verbose:
-                    print(f"Iteration {iteration + 1}: Pheromone reinitialization")
+            if self.stagnation_counter > 0:
+                if self.stagnation_counter % (self.stagnation_threshold // 4) == 0:
+                    self._apply_pheromone_smoothing()
+                    print(f"Iteration {iteration + 1}: Pheromone smoothing applied")
+                if self.stagnation_counter >= self.stagnation_threshold:
+                    self._reinitialize_pheromones()
+                    self.stagnation_counter = 0
+                    if verbose:
+                        print(f"Iteration {iteration + 1}: Pheromone reinitialization")
             
             # Record history
             self.history['best_distances'].append(self.best_distance)
@@ -186,6 +206,100 @@ class ImprovedACO(MaxMinAntSystem):
             print(f"  Improvement rate: {improvement_rate:.1f}%")
         
         return self.get_best_solution()
+    
+    def _initialize(self) -> None:
+        """Initialize pheromone matrix, heuristic information, bounds, and candidate lists."""
+        # Call parent initialization
+        super()._initialize()
+        
+        # Compute candidate lists based on nearest neighbors
+        self._compute_candidate_lists()
+    
+    def _compute_candidate_lists(self) -> None:
+        """
+        Compute candidate lists for each city based on nearest neighbors.
+        
+        For each city, store the indices of the k nearest cities sorted by distance.
+        This speeds up the solution construction phase significantly.
+        """
+        self.candidate_lists = np.zeros((self.num_cities, self.candidate_list_size), dtype=np.int32)
+        
+        for city in range(self.num_cities):
+            # Get distances from current city to all other cities
+            distances = self.distance_matrix[city].copy()
+            distances[city] = np.inf  # Exclude the city itself
+            
+            # Get indices of k nearest neighbors
+            nearest_indices = np.argpartition(distances, min(self.candidate_list_size, self.num_cities - 1))[:self.candidate_list_size]
+            
+            # Sort the nearest neighbors by distance
+            nearest_indices = nearest_indices[np.argsort(distances[nearest_indices])]
+            
+            self.candidate_lists[city] = nearest_indices
+    
+    def _construct_solution(self) -> List[int]:
+        """
+        Construct a solution (tour) for one ant using the probabilistic rule with candidate lists.
+        
+        Returns:
+            List of city indices representing a complete tour
+        """
+        tour = []
+        unvisited = set(range(self.num_cities))
+        
+        # Start from a random city
+        current_city = self.rng.integers(0, self.num_cities)
+        tour.append(current_city)
+        unvisited.remove(current_city)
+        
+        # Construct the rest of the tour
+        while unvisited:
+            next_city = self._select_next_city(current_city, unvisited)
+            tour.append(next_city)
+            unvisited.remove(next_city)
+            current_city = next_city
+        
+        return tour
+    
+    def _select_next_city(self, current_city: int, unvisited: set) -> int:
+        """
+        Select the next city to visit using candidate list and probabilistic transition rule.
+        
+        First tries to select from the candidate list. If all candidates are already visited,
+        falls back to selecting from all unvisited cities.
+        
+        Args:
+            current_city: Current city index
+            unvisited: Set of unvisited city indices
+        
+        Returns:
+            Next city to visit
+        """
+        # Get candidate cities that are still unvisited
+        candidates = [city for city in self.candidate_lists[current_city] if city in unvisited]
+        
+        # If no candidates available in the candidate list, use all unvisited cities
+        if not candidates:
+            candidates = list(unvisited)
+            self.fallback_to_all_cities += 1
+        else:
+            self.candidate_list_usage += 1
+        
+        # Calculate probabilities for candidate cities
+        pheromone_values = self.pheromone[current_city, candidates]
+        heuristic_values = self.heuristic[current_city, candidates]
+        
+        # Avoid numerical issues
+        pheromone_values = np.maximum(pheromone_values, 1e-10)
+        heuristic_values = np.maximum(heuristic_values, 1e-10)
+        
+        # Calculate attractiveness: τ^α * η^β
+        attractiveness = (pheromone_values ** self.alpha) * (heuristic_values ** self.beta)
+        probabilities = attractiveness / attractiveness.sum()
+        
+        # Select next city according to probabilities
+        next_city_idx = self.rng.choice(len(candidates), p=probabilities)
+        return candidates[next_city_idx]
     
     def _apply_2opt(self, tour: List[int], current_distance: float) -> Tuple[List[int], float]:
         """
@@ -316,16 +430,23 @@ class ImprovedACO(MaxMinAntSystem):
     
     def get_local_search_statistics(self) -> dict:
         """
-        Get statistics about local search performance.
+        Get statistics about local search and candidate list performance.
         
         Returns:
-            Dictionary with local search statistics
+            Dictionary with local search and candidate list statistics
         """
         improvement_rate = (self.local_search_improvements / max(self.total_local_searches, 1)) * 100
+        total_selections = self.candidate_list_usage + self.fallback_to_all_cities
+        candidate_usage_rate = (self.candidate_list_usage / max(total_selections, 1)) * 100
+        
         return {
             'total_applications': self.total_local_searches,
             'improvements_found': self.local_search_improvements,
-            'improvement_rate_percent': improvement_rate
+            'improvement_rate_percent': improvement_rate,
+            'candidate_list_size': self.candidate_list_size,
+            'candidate_list_usage': self.candidate_list_usage,
+            'fallback_to_all_cities': self.fallback_to_all_cities,
+            'candidate_usage_rate_percent': candidate_usage_rate
         }
     
     def get_parameters(self) -> dict:
@@ -336,9 +457,10 @@ class ImprovedACO(MaxMinAntSystem):
             Dictionary of parameters
         """
         params = super().get_parameters()
-        params['algorithm'] = 'Improved ACO (MMAS + 2-opt)'
+        params['algorithm'] = 'Improved ACO (MMAS + 2-opt + Candidate Lists)'
         params['apply_local_search_to_all'] = self.apply_local_search_to_all
         params['max_local_search_iterations'] = self.max_local_search_iterations
+        params['candidate_list_size'] = self.candidate_list_size
         return params
     
     def __repr__(self) -> str:
@@ -346,6 +468,7 @@ class ImprovedACO(MaxMinAntSystem):
         return (
             f"ImprovedACO(num_cities={self.num_cities}, num_ants={self.num_ants}, "
             f"alpha={self.alpha}, beta={self.beta}, rho={self.evaporation_rate}, "
+            f"candidate_list_size={self.candidate_list_size}, "
             f"local_search={ls_strategy}, "
             f"best_distance={self.best_distance:.2f})"
         )

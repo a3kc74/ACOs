@@ -102,12 +102,7 @@ Examples:
 def create_algorithm(
     algo_name: str,
     distance_matrix: np.ndarray,
-    num_ants: int,
-    alpha: float,
-    beta: float,
-    rho: Optional[float],
-    q: float,
-    seed: Optional[int]
+    **kwargs
 ):
     """
     Factory function to create algorithm instances.
@@ -115,16 +110,19 @@ def create_algorithm(
     Args:
         algo_name: Name of algorithm ('AS', 'MMAS', 'Improved')
         distance_matrix: Distance matrix
-        num_ants: Number of ants
-        alpha: Pheromone importance
-        beta: Heuristic importance
-        rho: Evaporation rate (None for default)
-        q: Pheromone deposit constant
-        seed: Random seed
+        **kwargs: Algorithm parameters (num_ants, alpha, beta, rho, q, seed, etc.)
     
     Returns:
         Algorithm instance
     """
+    # Extract only the parameters needed for algorithm construction
+    num_ants = kwargs.get('num_ants', 20)
+    alpha = kwargs.get('alpha', 1.0)
+    beta = kwargs.get('beta', 2.0)
+    rho = kwargs.get('rho', None)
+    q = kwargs.get('q', 100.0)
+    seed = kwargs.get('seed', None)
+    
     if algo_name == 'AS':
         evap_rate = rho if rho is not None else 0.5
         return AntSystem(
@@ -224,6 +222,7 @@ def run_multiple_times(
     algo_name: str,
     distance_matrix: np.ndarray,
     num_runs: int,
+    verbose: bool = False,
     **kwargs
 ) -> Dict:
     """
@@ -243,8 +242,10 @@ def run_multiple_times(
     all_convergence_iters = []
     best_result = None
     best_overall_distance = float('inf')
-    
+    print("X" * 70 + f"{verbose}")
     for run in range(num_runs):
+        if verbose:
+            print(f"\n--- Run {run + 1}/{num_runs} ---")
         seed = kwargs.get('seed', None)
         if seed is not None:
             seed = seed + run  # Different seed for each run
@@ -265,7 +266,7 @@ def run_multiple_times(
             algo_name=f"{algo_name} (Run {run + 1}/{num_runs})",
             max_iterations=kwargs['max_iterations'],
             early_stopping=kwargs['early_stopping'],
-            verbose=False  # Suppress verbose for multiple runs
+            verbose=verbose  # Use verbose flag for multiple runs
         )
         
         all_distances.append(result['best_distance'])
@@ -327,6 +328,13 @@ def save_results(
             **result['parameters']
         }
     )
+
+    if result.get('multi_run_stats'):
+        stats_file = os.path.join(save_dir, f'{problem_name}_{safe_algo_name}_stats.txt')
+        with open(stats_file, 'w') as f:
+            f.write("Multi-Run Statistics:\n")
+            for key, value in result['multi_run_stats'].items():
+                f.write(f"{key}: {value}\n")
     
     # Plot and save convergence curve
     conv_file = os.path.join(save_dir, f'{problem_name}_{safe_algo_name}_convergence.png')
@@ -402,6 +410,7 @@ def main():
                     algo_name=algo,
                     distance_matrix=distance_matrix,
                     num_runs=args.runs,
+                    verbose=args.verbose,
                     **algo_params
                 )
             else:

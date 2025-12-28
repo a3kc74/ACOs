@@ -61,18 +61,47 @@ class AntSystem(TSPAlgorithm):
         mask = self.distance_matrix > 0
         self.heuristic[mask] = 1.0 / self.distance_matrix[mask]
         
-        # Initial pheromone: τ_0 = num_ants / (approximate tour length)
-        # Use nearest neighbor heuristic for initial estimate
-        nn_tour_length = self._nearest_neighbor_tour_length()
-        self.tau_0 = self.num_ants / nn_tour_length
+        # Use nearest neighbor heuristic to get initial solution
+        nn_tour, nn_distance = self._nearest_neighbor_solution()
         
+        # Initialize with nearest neighbor solution as best solution
+        self._update_best_solution(nn_tour, nn_distance)
+        
+        # Initial pheromone: τ_0 = num_ants / (nearest neighbor tour length)
+        self.tau_0 = self.num_ants / nn_distance
+    
         # Initialize pheromone matrix with τ_0
         self.pheromone = np.full(
             (self.num_cities, self.num_cities),
             self.tau_0,
             dtype=np.float64
         )
+
+        self._update_pheromones([nn_tour], [nn_distance])
         
+    def _nearest_neighbor_solution(self) -> Tuple[List[int], float]:
+        """
+        Construct a solution using nearest neighbor heuristic for initialization.
+        
+        Returns:
+            Tuple of (tour, tour_distance)
+        """
+        tour = []
+        unvisited = set(range(self.num_cities))
+        
+        current = 0
+        tour.append(current)
+        unvisited.remove(current)
+        
+        while unvisited:
+            nearest = min(unvisited, key=lambda city: self.distance_matrix[current, city])
+            tour.append(nearest)
+            unvisited.remove(nearest)
+            current = nearest
+        
+        distance = self.calculate_tour_distance(tour)
+        return tour, distance
+    
     def _nearest_neighbor_tour_length(self) -> float:
         """
         Calculate tour length using nearest neighbor heuristic for initialization.
@@ -80,20 +109,8 @@ class AntSystem(TSPAlgorithm):
         Returns:
             Approximate tour length
         """
-        unvisited = set(range(self.num_cities))
-        current = 0
-        unvisited.remove(current)
-        tour_length = 0.0
-        
-        while unvisited:
-            nearest = min(unvisited, key=lambda city: self.distance_matrix[current, city])
-            tour_length += self.distance_matrix[current, nearest]
-            current = nearest
-            unvisited.remove(current)
-        
-        # Return to start
-        tour_length += self.distance_matrix[current, 0]
-        return tour_length
+        _, distance = self._nearest_neighbor_solution()
+        return distance
     
     def solve(
         self,
